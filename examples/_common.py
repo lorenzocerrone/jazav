@@ -97,6 +97,22 @@ def _create(out: Path, plan: VirtualPlan, levels: int) -> Any:
     )
 
 
+# Distinct channel colors; ngio's default is yellow for every channel.
+_COLORS = ("00FFFF", "FF00FF", "FFFF00", "FF0000", "00FF00", "0000FF")
+
+
+def _set_display(container: Any) -> None:
+    """Give viewers usable contrast limits and colors.
+
+    ngio's default omero window is 0..65535 whatever the dtype, and napari-ome-zarr
+    uses it as fixed contrast limits, so uint8 data would render black. The
+    percentiles are computed on the lowest pyramid level (real pixels).
+    """
+    container.set_channel_windows_with_percentiles((0.1, 99.9))
+    n = container.num_channels
+    container.set_channel_colors([_COLORS[i % len(_COLORS)] for i in range(n)])
+
+
 def _add_tables(container: Any, plan: VirtualPlan) -> None:
     """Add `well_ROI_table` (whole image) and `FOV_ROI_table` (one ROI per tile)."""
     image = container.get_image()
@@ -155,6 +171,7 @@ def build_virtual(out: Path, plan: VirtualPlan, levels: int = 3) -> None:
     # created. The pyramid is built by reading level 0 through the codec.
     container = open_ome_zarr_container(out)
     container.get_image().consolidate(mode="auto")
+    _set_display(container)
     _add_tables(container, plan)
 
 
@@ -166,6 +183,7 @@ def build_copy(
     image = container.get_image()
     image.set_array(truth, axes_order=plan.axes)
     image.consolidate(mode="auto")
+    _set_display(container)
     _add_tables(container, plan)
 
 
