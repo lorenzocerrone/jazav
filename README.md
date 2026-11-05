@@ -3,6 +3,22 @@
 Virtual OME-Zarr: a zarr v3 codec that references pixels in the original
 microscopy files instead of copying them.
 
+> **Proof of concept.** jazav was written at the 2026 OME-Zarr Hackathon in
+> Zurich to play with the idea of virtualization under three constraints:
+>
+> - **Do not modify the raw data.** The vendor files are read-only inputs; the
+>   OME-Zarr points into them, and deleting it leaves them untouched.
+> - **Do not use a custom store.** A virtual OME-Zarr is a plain directory on a
+>   plain `LocalStore` (or fsspec); only the level-0 array carries a custom
+>   codec, so every other part of the hierarchy works with any zarr tool.
+> - **Keep everything else standard OME-Zarr.** Pyramid levels, metadata and
+>   tables are ordinary, and `jazav materialize` turns the image into a
+>   conventional one at any time.
+>
+> It is not production software: the codec is only readable by zarr-python,
+> the on-disk format is frozen at version 1 but has had little use in anger,
+> and the vendor-format examples cover a handful of sample files.
+
 A virtual OME-Zarr is a normal OME-Zarr whose level-0 chunks are 20-byte
 references (source file, byte offset, byte length) into the original files, which
 are never modified. The `jazav.reference` codec, discovered through the
