@@ -165,6 +165,22 @@ pixi run -e dev chores      # format, tests, lint, type check
 pixi run -e dev example-tiff
 ```
 
+### A committed sample
+
+`samples/tiff_grid` holds a small virtual OME-Zarr built by `examples/tiff_grid.py`:
+four uncompressed 64x64 uint16 TIFF tiles under `raw/tiff/` and the image under
+`tiff/virtual.zarr`, whose level 0 references the tiles. It is the format's
+regression fixture (`tests/test_sample.py`), a quick thing to look at, and an
+easy `verify`/`materialize` target:
+
+```bash
+pixi run -e dev jazav verify samples/tiff_grid/tiff/virtual.zarr
+pixi run -e napari napari-sample   # open it in napari
+```
+
+To regenerate it, run `python examples/tiff_grid.py --out DIR` and copy
+`DIR/raw/tiff` and `DIR/tiff/virtual.zarr` back into place.
+
 ### Checking a viewer
 
 The `napari` environment adds napari, Qt and napari-ome-zarr (which reads

@@ -118,6 +118,8 @@ chores = { depends-on = ["ruff", "test-all", "lint", "typecheck"] }
 [tool.pixi.feature.napari.tasks]
 # Build the TIFF example, then open its virtual OME-Zarr in napari.
 napari-tiff = { cmd = "python examples/napari_view.py _examples_out/tiff_grid/tiff/virtual.zarr", depends-on = ["example-tiff"] }
+# Open the committed sample (no build needed).
+napari-sample = "python examples/napari_view.py samples/tiff_grid/tiff/virtual.zarr"
 test-napari = "pytest tests/test_napari.py --no-cov"
 typecheck-napari = "ty check --python .pixi/envs/napari examples/napari_view.py"
 

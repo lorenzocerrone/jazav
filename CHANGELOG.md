@@ -4,6 +4,10 @@
 
 ### Features
 
+- `samples/tiff_grid`: a committed virtual OME-Zarr (2x2 grid of uncompressed
+  TIFF tiles, 64 KiB in total) that `tests/test_sample.py` reads back, so a
+  change that breaks the on-disk format fails the test suite.
+
 - Reference format version 1: every level-0 chunk of a virtual array is a 20-byte
   `(source, offset, length)` reference into an original file.
 - `jazav.reference`, a read-only zarr v3 array-to-bytes codec that resolves the

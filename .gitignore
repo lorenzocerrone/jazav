@@ -16,4 +16,6 @@ coverage.xml
 # example and test output
 _examples_out/
 *.zarr/
+# the committed sample is the exception
+!samples/**/*.zarr/
 .DS_Store
