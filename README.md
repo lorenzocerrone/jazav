@@ -1,0 +1,179 @@
+# jazav
+
+Virtual OME-Zarr: a zarr v3 codec that references pixels in the original
+microscopy files instead of copying them.
+
+A virtual OME-Zarr is a normal OME-Zarr whose level-0 chunks are 20-byte
+references (source file, byte offset, byte length) into the original files, which
+are never modified. The `jazav.reference` codec, discovered through the
+`zarr.codecs` entry point, resolves the references at read time. Pyramid levels
+above 0 hold real pixels, built by reading level 0 through the codec.
+
+## Install
+
+```bash
+pip install jazav            # codec + helpers; depends on zarr only
+pip install "jazav[examples]"  # ngio, tifffile, liffile, czifile, nd2 for examples/
+```
+
+Requires Python >= 3.12 and zarr >= 3.2.1.
+
+## Reading
+
+Nothing to do. Once `jazav` is installed, every reader built on zarr-python
+(ngio, ome-zarr-py, napari-ome-zarr, dask, plain `zarr.open`) reads a virtual
+OME-Zarr like any other:
+
+```python
+import zarr
+
+image = zarr.open_group("plate.zarr/B/03/0", mode="r")
+level0 = image["0"][:]  # resolved from the original files on the fly
+```
+
+Readers that do not use zarr-python (zarrs, TensorStore, zarr-java, JavaScript
+viewers) see an unknown codec on level 0 and still read the other levels. That
+reader scope is accepted; `jazav materialize` removes the dependency entirely.
+
+## Writing
+
+```python
+import zarr
+import jazav
+
+group = zarr.open_group("image.zarr", mode="r+")
+array_dir = "image.zarr/0"
+sources = jazav.normalize_sources(
+    [jazav.relative_source_path(array_dir, f) for f in ("raw/A01_f0.tif", "raw/A01_f1.tif")]
+)
+array = jazav.create_reference_array(
+    group, "0",
+    shape=(1, 1, 1024, 2048), chunks=(1, 1, 1024, 1024), dtype="uint16",
+    fill_value=0, dimension_names=("c", "z", "y", "x"),
+    sources=sources, sizes=[8388744, 8388744],
+    codecs=[{"name": "bytes", "configuration": {"endian": "little"}}],
+)
+jazav.write_references(array, {(0, 0, 0, 0): (0, 136, 2097152), (0, 0, 0, 1): (1, 136, 2097152)})
+```
+
+Every level-0 chunk must be exactly one stored block of one source file: the
+chunk shape is the block shape and blocks must sit on the chunk grid without
+overlap. The `examples/` scripts show this for a TIFF grid and for Leica LIF,
+Zeiss CZI and Nikon ND2 files, building the container with ngio.
+
+## Commands
+
+```bash
+jazav verify image.zarr          # sources exist, sizes match, references in range
+jazav verify --deep image.zarr   # also decode every chunk
+jazav materialize image.zarr     # rewrite level 0 in place as a regular array
+```
+
+Both are also plain functions: `jazav.verify(path)` returns a report with
+`.ok` and `.problems`; `jazav.materialize(path)` returns the rewritten paths.
+`materialize` copies chunk by chunk into a sibling array and swaps it in with
+two renames; if it is interrupted in between, a `<level>-virtual-old` directory
+is left next to the array and renaming it back restores the references.
+
+## Reference format, version 1 (frozen)
+
+Chunk payload: exactly 20 bytes, `struct.Struct("<IQQ")`.
+
+| offset | size | field           | meaning                                       |
+|--------|------|-----------------|-----------------------------------------------|
+| 0      | 4    | `uint32 source` | index into the codec's `sources` table        |
+| 4      | 8    | `uint64 offset` | byte offset of the stored block in the source |
+| 12     | 8    | `uint64 length` | byte length of the stored block               |
+
+A missing chunk file reads as `fill_value`. Level-0 `zarr.json`: the reference
+codec is the **only** codec (`filters: []`, `compressors: []`), default chunk-key
+encoding with separator `/`:
+
+```json
+{"name": "jazav.reference",
+ "configuration": {
+   "version": 1,
+   "sources": ["../../../raw/A01_f0.tif", "../../../raw/A01_f1.tif"],
+   "sizes": [8388744, 8388744],
+   "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}]}}
+```
+
+- `sources[i]`: `/`-separated path relative to the array's key prefix, may start
+  with `..`; rejected if absolute, has a URL scheme, contains `\`, or has empty
+  or `.` segments. Deduplicated and sorted when written.
+- `sizes[i]`: byte size of each source at write time. The codec compares it with
+  the real file once per source before the first read, so a truncated or replaced
+  file is refused instead of decoded into garbage. Checked for local and fsspec
+  stores; other stores rely on strict byte-range reads.
+- `codecs`: the nested zarr v3 chain that turns one chunk's raw bytes into the
+  chunk array, identical for every chunk of the array: `[bytes]`,
+  `[transpose, bytes]` for blocks stored in another axis order, `[bytes, zstd]`
+  or `[bytes, numcodecs.zlib]` for compressed blocks.
+- The codec name `jazav.reference` and this layout are frozen. An unknown
+  `version` raises an error naming the installed `jazav` version.
+
+## How it works, and what it relies on
+
+zarr-python routes a read through a codec's partial-decode hook only when the
+array's sole codec is an array-to-bytes codec that implements
+`ArrayBytesCodecPartialDecodeMixin`. That hook receives the store path of the
+chunk, which is what lets the codec read the 20-byte payload, resolve the source
+relative to the array and issue a byte-range request on it. Hence the single-
+codec rule. Sources above the store root are reached by opening a read-only
+parent `LocalStore` or `FsspecStore`; other store types must be opened at a root
+that contains the sources. The codec is picklable for dask's process schedulers.
+
+Semi-private zarr APIs used: `StorePath`, `parse_named_configuration`,
+`parse_codecs`, `get_pipeline_class`, `zarr.core.sync.sync`,
+`default_buffer_prototype`. The test suite runs against the zarr floor
+(3.2.1) and the latest release, and `create_reference_array` refuses to
+create an array that the installed zarr would not route through partial
+decoding.
+
+## Examples
+
+`examples/` holds one script per format. Each builds a virtual OME-Zarr with
+ngio next to a copying conversion of the same pixels, checks that both read
+identically (level 0 against the vendor reader, levels above against the copy),
+runs `verify`, and prints one row per image. Results on the sample files
+(`pixi run -e dev example-all`, 2026-11-05):
+
+| script | input | result |
+|---|---|---|
+| `tiff_grid.py` | 2x2 grid of uncompressed TIFF tiles, same grid as `.npy` | virtual, 30 KiB vs 61 KiB copy |
+| `tiff_grid.py` | zlib-compressed TIFF tiles | not virtualizable (compressed) |
+| `leica_lif.py` | `hcs_2w1p3c5z1t.lif`, 2 images, 4 mosaic tiles of `(3, 5, 256, 256)` uint8 | virtual, one range per tile, no transpose |
+| `zeiss_czi.py` | `hcs_2w2p2c1z1t_pos.czi`, 4 scenes, ZSTD1 subblocks | virtual as `[bytes, zstd]` past the 3-byte header |
+| `zeiss_czi.py` | `img_4p2c1z1t_ManuallyDrawnRegion.czi` | not virtualizable (subblock at y=115 is off the 128-pixel grid) |
+| `nikon_nd2.py` | 7 uncompressed files, frames stored `(y, x, c)` | virtual with `[transpose, bytes]` (nd2 0.12.0, private `_frame_offsets`) |
+
+What qualifies: every level-0 chunk is exactly one stored block of one source
+file, so the chunk shape is the block shape and blocks must sit on the chunk
+grid without overlap. TIFF needs a contiguous uncompressed series; LIF a
+contiguous memory block with the mosaic dimension slowest; CZI uncompressed,
+ZSTD0 or ZSTD1 subblocks without hi-lo byte unpacking; ND2 no lossy
+compression and no padded rows. Compressed PNG/JPEG tiles, JPEG-XR CZI
+subblocks and lossy ND2 are never virtualizable. The ND2 `lossless` (zlib)
+path is implemented but unverified for lack of a sample.
+
+## Development
+
+```bash
+pixi install
+pixi run -e dev test-all    # py3.12 + zarr 3.2.1 and py3.13 + latest zarr
+pixi run -e dev chores      # format, tests, lint, type check
+pixi run -e dev example-tiff
+```
+
+### Checking a viewer
+
+The `napari` environment adds napari, Qt and napari-ome-zarr (which reads
+through ome-zarr-py and zarr-python, so the codec is picked up with no
+viewer-side change):
+
+```bash
+pixi run -e napari napari-tiff   # build the TIFF example and open it in napari
+pixi run -e napari python examples/napari_view.py path/to/virtual.zarr
+pixi run -e napari napari --plugin napari-ome-zarr path/to/virtual.zarr   # same, no script
+pixi run -e napari test-napari   # headless: the napari-ome-zarr reader returns the right pixels
+```

@@ -1,0 +1,8 @@
+[default.extend-identifiers]
+FOV = "FOV"
+FOVs = "FOVs"
+
+[default.extend-words]
+iy = "iy"
+OME = "OME"
+nd = "nd"

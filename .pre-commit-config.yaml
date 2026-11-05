@@ -1,0 +1,21 @@
+# Hooks are run by `prek` (a drop-in reimplementation of pre-commit):
+# `pixi run -e dev lint`. Bump the `rev:` pins with `prek auto-update`.
+
+repos:
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: v0.25
+    hooks:
+      - id: validate-pyproject
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.47.2
+    hooks:
+      - id: typos
+        args: [--force-exclude]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
