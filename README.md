@@ -25,6 +25,8 @@ are never modified. The `jazav.reference` codec, discovered through the
 `zarr.codecs` entry point, resolves the references at read time. Pyramid levels
 above 0 hold real pixels, built by reading level 0 through the codec.
 
+![Virtualization strategy](docs/virtualization.png)
+
 ## Install
 
 ```bash
