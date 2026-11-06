@@ -16,14 +16,16 @@ microscopy files instead of copying them.
 >   conventional one at any time.
 >
 > It is not production software: the codec is only readable by zarr-python,
-> the on-disk format is frozen at version 1 but has had little use in anger,
+> the on-disk format is frozen at version 2 but has had little use in anger,
 > and the vendor-format examples cover a handful of sample files.
 
-A virtual OME-Zarr is a normal OME-Zarr whose level-0 chunks are 20-byte
-references (source file, byte offset, byte length) into the original files, which
-are never modified. The `jazav.reference` codec, discovered through the
-`zarr.codecs` entry point, resolves the references at read time. Pyramid levels
-above 0 hold real pixels, built by reading level 0 through the codec.
+A virtual OME-Zarr is a normal OME-Zarr whose level 0 is stored as a few
+**reference tables**: one 20-byte entry (source file, byte offset, byte length)
+per chunk, pointing into the original files, which are never modified. The
+`jazav.reference` codec, discovered through the `zarr.codecs` entry point, reads
+a table once and resolves the references at read time, merging adjacent byte
+ranges into single requests. Pyramid levels above 0 hold real pixels, built by
+reading level 0 through the codec.
 
 ![Virtualization strategy](docs/virtualization.png)
 
@@ -51,7 +53,8 @@ level0 = image["0"][:]  # resolved from the original files on the fly
 
 Readers that do not use zarr-python (zarrs, TensorStore, zarr-java, JavaScript
 viewers) see an unknown codec on level 0 and still read the other levels. That
-reader scope is accepted; `jazav materialize` removes the dependency entirely.
+reader scope is accepted; `jazav materialize` removes the dependency entirely,
+and `jazav export-refs` gives web viewers a way in (below).
 
 ## Writing
 
@@ -74,10 +77,19 @@ array = jazav.create_reference_array(
 jazav.write_references(array, {(0, 0, 0, 0): (0, 136, 2097152), (0, 0, 0, 1): (1, 136, 2097152)})
 ```
 
-Every level-0 chunk must be exactly one stored block of one source file: the
-chunk shape is the block shape and blocks must sit on the chunk grid without
-overlap. The `examples/` scripts show this for a TIFF grid and for Leica LIF,
-Zeiss CZI and Nikon ND2 files, building the container with ngio.
+`chunks` is the shape of one stored block. Every level-0 chunk must be exactly
+one stored block of one source file: blocks must sit on the chunk grid without
+overlap. The array's zarr chunks are *shards*, each holding one reference table;
+by default the whole array is one shard while it has at most 16,384 chunks, and
+larger arrays are split along the slowest axes first, leaving y and x whole.
+Pass `shards=` to choose, e.g. one shard per plane. `write_references` writes
+whole tables, so call it once with all the references. The `examples/` scripts
+show this for a TIFF grid and for Leica LIF, Zeiss CZI and Nikon ND2 files,
+building the container with ngio.
+
+Note that `array.chunks` reports the shard shape, as zarr does for any custom
+codec; the block shape is `jazav.reference_codec(array).chunk_shape`. Dask built
+on `array.chunks` therefore sees one task per shard.
 
 ## Commands
 
@@ -85,17 +97,52 @@ Zeiss CZI and Nikon ND2 files, building the container with ngio.
 jazav verify image.zarr          # sources exist, sizes match, references in range
 jazav verify --deep image.zarr   # also decode every chunk
 jazav materialize image.zarr     # rewrite level 0 in place as a regular array
+jazav export-refs image.zarr --base-url https://host/data/image.zarr/   # kerchunk manifest
 ```
 
-Both are also plain functions: `jazav.verify(path)` returns a report with
-`.ok` and `.problems`; `jazav.materialize(path)` returns the rewritten paths.
+All are also plain functions: `jazav.verify(path)` returns a report with
+`.ok` and `.problems`; `jazav.materialize(path)` returns the rewritten paths;
+`jazav.export_references(path, base_url, out=...)` returns the manifest.
 `materialize` copies chunk by chunk into a sibling array and swaps it in with
 two renames; if it is interrupted in between, a `<level>-virtual-old` directory
 is left next to the array and renaming it back restores the references.
 
-## Reference format, version 1 (frozen)
+## Web viewers
 
-Chunk payload: exactly 20 bytes, `struct.Struct("<IQQ")`.
+Browsers cannot load the codec, but vizarr opens kerchunk manifests: a source
+URL that ends in `.json` (or starts with `ref://`) is read as a manifest that
+maps every key of the image to inline content or to a byte range of a URL.
+`jazav export-refs` writes that manifest for an image as served from one base
+URL:
+
+```bash
+jazav export-refs plate.zarr/B/03/0 --base-url https://host/data/plate.zarr/B/03/0/
+# -> plate.zarr/B/03/0.refs.json; open it with
+#    https://hms-dbmi.github.io/vizarr/?source=https://host/data/plate.zarr/B/03/0.refs.json
+```
+
+Every `zarr.json` is inlined, the level-0 one rewritten with the nested codecs
+and the block shape so the viewer sees a plain array; every other file (pyramid
+chunks, tables, labels) is `[url, 0, size]`, fetched live from the directory;
+every level-0 chunk is `[raw file url, offset, length]`. Source paths resolve
+against the array's URL with the same relative paths they have on disk, so the
+raw files must be served in the same layout relative to the zarr. The manifest
+fixes the set of keys and the file sizes, not their contents: regenerate it when
+a level, label or chunk is added, or whenever the directory is published.
+
+The host must allow cross-origin requests (`Access-Control-Allow-Origin`, the
+`Range` request header, `Content-Range` exposed) and honour HTTP range requests
+on the raw files. S3, GCS, nginx and Caddy do; Python's `http.server` does not.
+fsspec reads the same manifest from Python:
+`zarr.open_group("reference://", storage_options={"fo": "0.refs.json"}, mode="r")`.
+
+## Reference format, version 2 (frozen)
+
+The array's zarr chunk grid is the **shard** grid. Each stored shard key holds a
+reference table: `20 * n` bytes for a shard of `n` inner chunks (always the full
+size, also for shards that extend past the array's edge), one entry per inner
+chunk in C order over the shard's inner chunk grid. An entry is
+`struct.Struct("<IQQ")`:
 
 | offset | size | field           | meaning                                       |
 |--------|------|-----------------|-----------------------------------------------|
@@ -103,19 +150,25 @@ Chunk payload: exactly 20 bytes, `struct.Struct("<IQQ")`.
 | 4      | 8    | `uint64 offset` | byte offset of the stored block in the source |
 | 12     | 8    | `uint64 length` | byte length of the stored block               |
 
-A missing chunk file reads as `fill_value`. Level-0 `zarr.json`: the reference
-codec is the **only** codec (`filters: []`, `compressors: []`), default chunk-key
-encoding with separator `/`:
+An entry of twenty `0xFF` bytes marks an inner chunk without a block; it reads as
+`fill_value`, and so does every inner chunk of a shard key that does not exist.
+The source index `0xFFFFFFFF` is reserved for that entry and `length` is never 0.
+Level-0 `zarr.json`: the reference codec is the **only** codec (`filters: []`,
+`compressors: []`), default chunk-key encoding with separator `/`, and
+`chunk_grid.chunk_shape` (the shard shape) is a multiple of the codec's
+`chunk_shape`:
 
 ```json
 {"name": "jazav.reference",
  "configuration": {
-   "version": 1,
+   "version": 2,
+   "chunk_shape": [1, 1, 1024, 1024],
    "sources": ["../../../raw/A01_f0.tif", "../../../raw/A01_f1.tif"],
    "sizes": [8388744, 8388744],
    "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}]}}
 ```
 
+- `chunk_shape`: the inner chunk shape, i.e. the shape of one stored block.
 - `sources[i]`: `/`-separated path relative to the array's key prefix, may start
   with `..`; rejected if absolute, has a URL scheme, contains `\`, or has empty
   or `.` segments. Deduplicated and sorted when written.
@@ -123,8 +176,8 @@ encoding with separator `/`:
   the real file once per source before the first read, so a truncated or replaced
   file is refused instead of decoded into garbage. Checked for local and fsspec
   stores; other stores rely on strict byte-range reads.
-- `codecs`: the nested zarr v3 chain that turns one chunk's raw bytes into the
-  chunk array, identical for every chunk of the array: `[bytes]`,
+- `codecs`: the nested zarr v3 chain that turns one block's raw bytes into the
+  inner chunk array, identical for every chunk of the array: `[bytes]`,
   `[transpose, bytes]` for blocks stored in another axis order, `[bytes, zstd]`
   or `[bytes, numcodecs.zlib]` for compressed blocks.
 - The codec name `jazav.reference` and this layout are frozen. An unknown
@@ -135,11 +188,21 @@ encoding with separator `/`:
 zarr-python routes a read through a codec's partial-decode hook only when the
 array's sole codec is an array-to-bytes codec that implements
 `ArrayBytesCodecPartialDecodeMixin`. That hook receives the store path of the
-chunk, which is what lets the codec read the 20-byte payload, resolve the source
-relative to the array and issue a byte-range request on it. Hence the single-
-codec rule. Sources above the store root are reached by opening a read-only
-parent `LocalStore` or `FsspecStore`; other store types must be opened at a root
-that contains the sources. The codec is picklable for dask's process schedulers.
+shard and the selection within it, which is what lets the codec read the table,
+resolve the sources relative to the array and issue byte-range requests on them.
+Hence the single-codec rule. The table is decoded once per shard and cached in
+the codec (level 0 is read-only); blocks of one source that lie within 1 MiB of
+each other are read with one range request of at most 64 MiB; inner chunks are
+decoded through zarr's own codec pipeline, as `sharding_indexed` does. Sources
+above the store root are reached by opening a read-only parent `LocalStore` or
+`FsspecStore`; other store types must be opened at a root that contains the
+sources. The codec is picklable for dask's process schedulers.
+
+Why tables rather than one reference file per chunk (format 1): a read then
+needed two dependent store requests per chunk, which doubled the request count on
+object storage and put one tiny file per chunk on network filesystems. On a local
+disk, a 256-chunk read took 239 ms against 127 ms for a plain zarr; with tables
+and coalescing it takes 68 ms.
 
 Semi-private zarr APIs used: `StorePath`, `parse_named_configuration`,
 `parse_codecs`, `get_pipeline_class`, `zarr.core.sync.sync`,
@@ -187,7 +250,8 @@ pixi run -e dev example-tiff
 
 `samples/tiff_grid` holds a small virtual OME-Zarr built by `examples/tiff_grid.py`:
 four uncompressed 64x64 uint16 TIFF tiles under `raw/tiff/` and the image under
-`tiff/virtual.zarr`, whose level 0 references the tiles. It is the format's
+`tiff/virtual.zarr`, whose level 0 is one shard whose 80-byte table references
+the four tiles. It is the format's
 regression fixture (`tests/test_sample.py`), a quick thing to look at, and an
 easy `verify`/`materialize` target:
 

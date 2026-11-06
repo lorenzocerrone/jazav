@@ -56,18 +56,71 @@ class TestCreateReferenceArray:
             {
                 "name": "jazav.reference",
                 "configuration": {
-                    "version": 1,
+                    "version": 2,
+                    "chunk_shape": [1, 16, 24],
                     "sources": ["../../raw/a.bin"],
                     "sizes": [768],
                     "codecs": [BYTES_LE],
                 },
             }
         ]
+        # The zarr chunk grid is the shard: the whole array by default.
+        assert metadata["chunk_grid"]["configuration"]["chunk_shape"] == [2, 16, 24]
         assert metadata["chunk_key_encoding"] == {
             "name": "default",
             "configuration": {"separator": "/"},
         }
         assert metadata["dimension_names"] == ["c", "y", "x"]
+
+    def test_explicit_shards(self, tmp_path: Path) -> None:
+        group = zarr.open_group(tmp_path / "out.zarr", mode="w", zarr_format=3)
+        array = jazav.create_reference_array(
+            group,
+            "0",
+            shape=(2, 16, 24),
+            chunks=(1, 8, 24),
+            shards=(1, 16, 24),
+            dtype="uint16",
+            fill_value=0,
+            dimension_names=None,
+            sources=["a.bin"],
+            sizes=[1536],
+            codecs=[BYTES_LE],
+        )
+        assert array.chunks == (1, 16, 24)
+        codec = jazav.reference_codec(array)
+        assert codec is not None and codec.chunk_shape == (1, 8, 24)
+        with pytest.raises(jazav.ReferenceFormatError, match="not a positive multiple"):
+            jazav.create_reference_array(
+                group,
+                "1",
+                shape=(2, 16, 24),
+                chunks=(1, 8, 24),
+                shards=(1, 12, 24),
+                dtype="uint16",
+                fill_value=0,
+                dimension_names=None,
+                sources=["a.bin"],
+                sizes=[1536],
+                codecs=[BYTES_LE],
+            )
+
+    def test_default_shards_follow_the_chunk_bound(self, tmp_path: Path) -> None:
+        group = zarr.open_group(tmp_path / "out.zarr", mode="w", zarr_format=3)
+        array = jazav.create_reference_array(
+            group,
+            "0",
+            shape=(4, 16, 24),
+            chunks=(1, 8, 24),
+            max_chunks_per_shard=2,
+            dtype="uint16",
+            fill_value=0,
+            dimension_names=None,
+            sources=["a.bin"],
+            sizes=[1],
+            codecs=[BYTES_LE],
+        )
+        assert array.chunks == (1, 16, 24)
 
     def test_replaces_an_existing_array(self, tmp_path: Path) -> None:
         group = zarr.open_group(tmp_path / "out.zarr", mode="w", zarr_format=3)
@@ -87,9 +140,14 @@ class TestCreateReferenceArray:
         assert isinstance(array.metadata.codecs[0], jazav.ReferenceCodec)
         assert group["0"].chunks == (4, 4)
 
+    def test_reference_codec_helper(self, tmp_path: Path) -> None:
+        group = zarr.open_group(tmp_path / "out.zarr", mode="w", zarr_format=3)
+        plain = group.create_array("p", shape=(4,), chunks=(4,), dtype="uint8")
+        assert jazav.reference_codec(plain) is None
+
 
 class TestWriteReferences:
-    def test_writes_twenty_byte_chunk_files(self, tmp_path: Path, data: np.ndarray):
+    def test_writes_one_table_per_shard(self, tmp_path: Path, data: np.ndarray):
         array = write_virtual_array(
             LocalStore(tmp_path / "out.zarr"),
             shape=data.shape,
@@ -98,10 +156,39 @@ class TestWriteReferences:
             sources=["../../raw/plane0.bin"],
             references={(0, 0, 0): (0, 0, data[0].nbytes)},
         )
-        chunk = tmp_path / "out.zarr" / "0" / "c" / "0" / "0" / "0"
-        assert chunk.stat().st_size == 20
-        assert jazav.decode_reference(chunk.read_bytes()) == (0, 0, data[0].nbytes)
+        table = tmp_path / "out.zarr" / "0" / "c" / "0" / "0" / "0"
+        assert table.stat().st_size == 40  # two inner chunks, one table
+        assert jazav.decode_table(table.read_bytes(), 2) == [
+            jazav.ChunkReference(0, 0, data[0].nbytes),
+            None,
+        ]
         assert array.nchunks_initialized == 1
+
+    def test_groups_references_into_shards(self, tmp_path: Path, data: np.ndarray):
+        write_virtual_array(
+            LocalStore(tmp_path / "out.zarr"),
+            shape=data.shape,
+            chunks=(1, 8, 24),
+            shards=(1, 16, 24),
+            dtype="uint16",
+            sources=["../../raw/plane0.bin", "../../raw/plane1.bin"],
+            references={
+                (0, 0, 0): (0, 0, 384),
+                (0, 1, 0): (0, 384, 384),
+                (1, 1, 0): (1, 384, 384),
+            },
+        )
+        keys = sorted(
+            str(p.relative_to(tmp_path / "out.zarr" / "0"))
+            for p in (tmp_path / "out.zarr" / "0" / "c").rglob("*")
+            if p.is_file()
+        )
+        assert keys == ["c/0/0/0", "c/1/0/0"]
+        second = (tmp_path / "out.zarr" / "0" / "c" / "1" / "0" / "0").read_bytes()
+        assert jazav.decode_table(second, 2) == [
+            None,
+            jazav.ChunkReference(1, 384, 384),
+        ]
 
     @pytest.mark.parametrize(
         ("refs", "message"),

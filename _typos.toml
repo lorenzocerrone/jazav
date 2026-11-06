@@ -6,3 +6,4 @@ FOVs = "FOVs"
 iy = "iy"
 OME = "OME"
 nd = "nd"
+fo = "fo"  # fsspec's reference filesystem parameter
