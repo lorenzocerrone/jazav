@@ -18,6 +18,7 @@ except ImportError:  # running from a checkout without a build step
         __version__ = "0.0.0+unknown"
 
 from jazav._codec import CODEC_NAME, ReferenceCodec
+from jazav._export import export_references
 from jazav._references import (
     DEFAULT_MAX_CHUNKS_PER_SHARD,
     FORMAT_VERSION,
@@ -60,6 +61,7 @@ __all__ = [
     "default_shard_shape",
     "encode_reference",
     "encode_table",
+    "export_references",
     "materialize",
     "normalize_sources",
     "reference_codec",

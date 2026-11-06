@@ -22,6 +22,10 @@
 - `docs/roadmap/`: context files for the reference-table codec, the kerchunk
   manifest export and the vizarr store proof of concept.
 - `verify` and `materialize` as functions and as the `jazav` console script.
+- `export-refs`: a kerchunk manifest of a virtual image as served from a base
+  URL, for vizarr and fsspec. Metadata inlined with level 0 rewritten to plain
+  codecs, concrete files as `[url, 0, size]`, level-0 chunks as byte ranges of
+  the raw files.
 - `examples/tiff_grid.py`: virtualize a grid of uncompressed TIFF and `.npy` tiles
   into an OME-Zarr built with ngio; the reference example.
 - `examples/leica_lif.py`, `examples/zeiss_czi.py`, `examples/nikon_nd2.py`:

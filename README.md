@@ -53,7 +53,8 @@ level0 = image["0"][:]  # resolved from the original files on the fly
 
 Readers that do not use zarr-python (zarrs, TensorStore, zarr-java, JavaScript
 viewers) see an unknown codec on level 0 and still read the other levels. That
-reader scope is accepted; `jazav materialize` removes the dependency entirely.
+reader scope is accepted; `jazav materialize` removes the dependency entirely,
+and `jazav export-refs` gives web viewers a way in (below).
 
 ## Writing
 
@@ -96,13 +97,44 @@ on `array.chunks` therefore sees one task per shard.
 jazav verify image.zarr          # sources exist, sizes match, references in range
 jazav verify --deep image.zarr   # also decode every chunk
 jazav materialize image.zarr     # rewrite level 0 in place as a regular array
+jazav export-refs image.zarr --base-url https://host/data/image.zarr/   # kerchunk manifest
 ```
 
-Both are also plain functions: `jazav.verify(path)` returns a report with
-`.ok` and `.problems`; `jazav.materialize(path)` returns the rewritten paths.
+All are also plain functions: `jazav.verify(path)` returns a report with
+`.ok` and `.problems`; `jazav.materialize(path)` returns the rewritten paths;
+`jazav.export_references(path, base_url, out=...)` returns the manifest.
 `materialize` copies chunk by chunk into a sibling array and swaps it in with
 two renames; if it is interrupted in between, a `<level>-virtual-old` directory
 is left next to the array and renaming it back restores the references.
+
+## Web viewers
+
+Browsers cannot load the codec, but vizarr opens kerchunk manifests: a source
+URL that ends in `.json` (or starts with `ref://`) is read as a manifest that
+maps every key of the image to inline content or to a byte range of a URL.
+`jazav export-refs` writes that manifest for an image as served from one base
+URL:
+
+```bash
+jazav export-refs plate.zarr/B/03/0 --base-url https://host/data/plate.zarr/B/03/0/
+# -> plate.zarr/B/03/0.refs.json; open it with
+#    https://hms-dbmi.github.io/vizarr/?source=https://host/data/plate.zarr/B/03/0.refs.json
+```
+
+Every `zarr.json` is inlined, the level-0 one rewritten with the nested codecs
+and the block shape so the viewer sees a plain array; every other file (pyramid
+chunks, tables, labels) is `[url, 0, size]`, fetched live from the directory;
+every level-0 chunk is `[raw file url, offset, length]`. Source paths resolve
+against the array's URL with the same relative paths they have on disk, so the
+raw files must be served in the same layout relative to the zarr. The manifest
+fixes the set of keys and the file sizes, not their contents: regenerate it when
+a level, label or chunk is added, or whenever the directory is published.
+
+The host must allow cross-origin requests (`Access-Control-Allow-Origin`, the
+`Range` request header, `Content-Range` exposed) and honour HTTP range requests
+on the raw files. S3, GCS, nginx and Caddy do; Python's `http.server` does not.
+fsspec reads the same manifest from Python:
+`zarr.open_group("reference://", storage_options={"fo": "0.refs.json"}, mode="r")`.
 
 ## Reference format, version 2 (frozen)
 

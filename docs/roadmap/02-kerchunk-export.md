@@ -1,5 +1,12 @@
 # Step 2: kerchunk manifest export
 
+**Status: implemented** as `jazav export-refs` / `jazav.export_references`. One
+finding changed the design below: zarrita's `composeRange` treats a missing
+length as 0 and throws `Range out of bounds` for `[url]` entries, so whole-file
+entries are written as `[url, 0, size]` (one stat per file at export time) and
+all `zarr.json` files are inlined. The manifest is kerchunk version 1,
+`{"version": 1, "refs": {...}}`, keys without a leading slash.
+
 Context file for the second roadmap step. Depends on step 1 (format 2 tables).
 
 ## Why export at all

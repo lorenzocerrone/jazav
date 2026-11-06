@@ -1,5 +1,7 @@
 # Step 1: reference-table codec (format 2)
 
+**Status: implemented** (commit "Reference-table codec: format 2 replaces format 1").
+
 Context file for the first roadmap step. It records the findings and decisions
 of the 2026-11-06 design session so the work can be picked up without the
 conversation. Steps 2 and 3 have their own files next to this one.
