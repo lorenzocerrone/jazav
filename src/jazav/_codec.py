@@ -114,7 +114,9 @@ class _BlockGetter(ByteGetter):
     coords: tuple[int, ...]
 
     def get_sync(
-        self, prototype: BufferPrototype | None = None, byte_range: ByteRequest | None = None
+        self,
+        prototype: BufferPrototype | None = None,
+        byte_range: ByteRequest | None = None,
     ) -> Buffer | None:
         value = self.blocks.get(self.coords)
         if value is None or byte_range is None:
@@ -292,7 +294,9 @@ class ReferenceCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
     def compute_encoded_size(
         self, input_byte_length: int, chunk_spec: ArraySpec
     ) -> int:
-        return table_size(math.prod(chunks_per_shard(chunk_spec.shape, self.chunk_shape)))
+        return table_size(
+            math.prod(chunks_per_shard(chunk_spec.shape, self.chunk_shape))
+        )
 
     # -- helpers ----------------------------------------------------------
     def _inner_spec(self, shard_spec: ArraySpec) -> ArraySpec:
@@ -436,9 +440,15 @@ class ReferenceCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
                 requests.append((source_store, key, start, end - start, group))
 
         async def read(
-            source_store: Store, key: str, start: int, length: int, group: list[_Pending]
+            source_store: Store,
+            key: str,
+            start: int,
+            length: int,
+            group: list[_Pending],
         ) -> list[tuple[tuple[int, ...], Buffer]]:
-            data = await _storeio.read_range(source_store, key, prototype, start, length)
+            data = await _storeio.read_range(
+                source_store, key, prototype, start, length
+            )
             return [
                 (
                     item.coords,
@@ -458,8 +468,9 @@ class ReferenceCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
 
     # -- reading ----------------------------------------------------------
     async def _decode_partial_single(
-        self, byte_getter: ByteGetter, selection: SelectorTuple, shard_spec: ArraySpec
+        self, byte_getter: ByteGetter, selection: SelectorTuple, chunk_spec: ArraySpec
     ) -> NDBuffer | None:
+        shard_spec = chunk_spec  # the array's zarr chunk is the shard
         store, shard_key = _storeio.store_path_of(byte_getter)
         prototype = shard_spec.prototype
         per_shard = chunks_per_shard(shard_spec.shape, self.chunk_shape)
@@ -510,16 +521,21 @@ class ReferenceCodec(ArrayBytesCodec, ArrayBytesCodecPartialDecodeMixin):
             out,
         )
         if hasattr(indexer, "sel_shape"):
-            return out.reshape(indexer.sel_shape)
+            return out.reshape(cast("tuple[int, ...]", indexer.sel_shape))
         return out
 
-    async def _decode_single(self, chunk_data: Buffer, chunk_spec: ArraySpec) -> NDBuffer:
-        # Only reached when the codec is combined with other codecs, which
-        # bypasses partial decoding. Without a store, references cannot resolve.
+    async def _decode_single(
+        self, chunk_data: Buffer, chunk_spec: ArraySpec
+    ) -> NDBuffer:
+        # Reached without a store, so references cannot resolve: zarr takes this
+        # path when it reads a shard before a partial write, or when the codec is
+        # combined with other codecs, which bypasses partial decoding.
         raise ReferenceFormatError(
-            f"{CODEC_NAME} must be the array's only codec (no filters or "
-            "compressors): it resolves references through the partial-decode "
-            "path, which zarr uses only for a lone array->bytes codec."
+            f"{CODEC_NAME} arrays are read-only and the codec must be the array's "
+            "only codec. zarr reached the plain decode path, which happens when "
+            "writing into a virtual array (the shard is read before a partial "
+            "write; run `jazav materialize` to make the array writable) or when "
+            "the codec is combined with filters or compressors."
         )
 
     async def _encode_single(

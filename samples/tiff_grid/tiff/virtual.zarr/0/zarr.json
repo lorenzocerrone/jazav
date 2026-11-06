@@ -12,8 +12,8 @@
       "chunk_shape": [
         1,
         1,
-        64,
-        64
+        128,
+        128
       ]
     }
   },
@@ -28,7 +28,13 @@
     {
       "name": "jazav.reference",
       "configuration": {
-        "version": 1,
+        "version": 2,
+        "chunk_shape": [
+          1,
+          1,
+          64,
+          64
+        ],
         "sources": [
           "../../../raw/tiff/tile_y0_x0.tif",
           "../../../raw/tiff/tile_y0_x1.tif",

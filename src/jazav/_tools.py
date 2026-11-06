@@ -186,9 +186,7 @@ def verify(
     return report
 
 
-def _regions(
-    shape: tuple[int, ...], block: tuple[int, ...]
-) -> list[tuple[slice, ...]]:
+def _regions(shape: tuple[int, ...], block: tuple[int, ...]) -> list[tuple[slice, ...]]:
     counts = [-(-s // c) for s, c in zip(shape, block, strict=True)]
     return [
         tuple(
@@ -210,7 +208,9 @@ def _read_regions(array: zarr.Array) -> list[tuple[slice, ...]]:
     block = list(array.chunks)
     itemsize = array.dtype.itemsize
     for axis in range(len(block)):
-        while math.prod(block) * itemsize > READ_BLOCK_BYTES and block[axis] > inner[axis]:
+        while (
+            math.prod(block) * itemsize > READ_BLOCK_BYTES and block[axis] > inner[axis]
+        ):
             block[axis] = inner[axis] * math.ceil(block[axis] / inner[axis] / 2)
     return _regions(array.shape, tuple(block))
 

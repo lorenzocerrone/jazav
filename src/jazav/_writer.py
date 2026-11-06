@@ -154,7 +154,8 @@ def write_references(
     """
     codec = reference_codec(array)
     if codec is None:
-        first = array.metadata.codecs[0] if getattr(array.metadata, "codecs", None) else None
+        codecs = getattr(array.metadata, "codecs", ())
+        first = codecs[0] if codecs else None
         raise ReferenceFormatError(
             f"array {array.path!r} is not a reference array (its first codec is "
             f"{type(first).__name__}); create it with create_reference_array."

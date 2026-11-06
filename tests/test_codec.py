@@ -9,19 +9,35 @@ from zarr.core.sync import sync
 from zarr.storage import LocalStore, MemoryStore, WrapperStore
 
 import jazav
-from jazav import _storeio
-from tests.conftest import BYTES_LE, raw_files, write_raw_chunk, write_virtual_array
+from jazav import _codec, _storeio
+from tests.conftest import (
+    BYTES_LE,
+    raw_files,
+    write_raw_shard,
+    write_table,
+    write_virtual_array,
+)
+
+
+def make_codec(**overrides):
+    kwargs = {
+        "chunk_shape": (1, 16, 24),
+        "sources": ["../../raw/a.bin"],
+        "sizes": [768],
+        "codecs": [BYTES_LE],
+    }
+    kwargs.update(overrides)
+    return jazav.ReferenceCodec(**kwargs)
 
 
 class TestReferenceCodecMetadata:
     def test_to_dict_matches_documented_layout(self) -> None:
-        codec = jazav.ReferenceCodec(
-            sources=["../../raw/a.bin"], sizes=[768], codecs=[BYTES_LE]
-        )
+        codec = make_codec()
         assert codec.to_dict() == {
             "name": "jazav.reference",
             "configuration": {
-                "version": 1,
+                "version": 2,
+                "chunk_shape": [1, 16, 24],
                 "sources": ["../../raw/a.bin"],
                 "sizes": [768],
                 "codecs": [BYTES_LE],
@@ -34,34 +50,58 @@ class TestReferenceCodecMetadata:
             jazav.ReferenceCodec.from_dict(
                 {
                     "name": "jazav.reference",
-                    "configuration": {"sources": ["a"], "codecs": [BYTES_LE]},
+                    "configuration": {
+                        "chunk_shape": [1],
+                        "sources": ["a"],
+                        "codecs": [BYTES_LE],
+                    },
+                }
+            )
+        with pytest.raises(jazav.ReferenceFormatError, match="missing 'chunk_shape'"):
+            jazav.ReferenceCodec.from_dict(
+                {
+                    "name": "jazav.reference",
+                    "configuration": {"sources": ["a"], "sizes": [1], "codecs": []},
                 }
             )
 
     def test_rejects_bad_configuration(self) -> None:
         with pytest.raises(jazav.ReferenceFormatError, match="at least one source"):
-            jazav.ReferenceCodec(sources=[], sizes=[], codecs=[BYTES_LE])
+            make_codec(sources=[], sizes=[])
         with pytest.raises(jazav.ReferenceFormatError, match="duplicate"):
-            jazav.ReferenceCodec(sources=["a", "a"], sizes=[1, 1], codecs=[BYTES_LE])
+            make_codec(sources=["a", "a"], sizes=[1, 1])
         with pytest.raises(jazav.ReferenceFormatError, match="relative"):
-            jazav.ReferenceCodec(sources=["/abs"], sizes=[1], codecs=[BYTES_LE])
+            make_codec(sources=["/abs"], sizes=[1])
         with pytest.raises(jazav.ReferenceFormatError, match="sizes has 2"):
-            jazav.ReferenceCodec(sources=["a"], sizes=[1, 2], codecs=[BYTES_LE])
+            make_codec(sources=["a"], sizes=[1, 2])
         with pytest.raises(jazav.ReferenceFormatError, match="non-negative"):
-            jazav.ReferenceCodec(sources=["a"], sizes=[-1], codecs=[BYTES_LE])
+            make_codec(sources=["a"], sizes=[-1])
+        with pytest.raises(jazav.ReferenceFormatError, match="chunk_shape"):
+            make_codec(chunk_shape=(0, 16, 24))
+        with pytest.raises(jazav.ReferenceFormatError, match="chunk_shape"):
+            make_codec(chunk_shape=())
 
-    def test_unknown_version_names_installed_jazav(self) -> None:
+    def test_format_1_is_refused_naming_installed_jazav(self) -> None:
         with pytest.raises(
             jazav.ReferenceFormatError,
-            match=re.escape(f"version 2: jazav {jazav.__version__}"),
+            match=re.escape(f"version 1: jazav {jazav.__version__} reads version 2"),
         ):
-            jazav.ReferenceCodec(sources=["a"], sizes=[1], codecs=[BYTES_LE], version=2)
+            make_codec(version=1)
 
     def test_pickle_roundtrip(self) -> None:
-        codec = jazav.ReferenceCodec(
-            sources=["a.bin", "b.bin"], sizes=[1, 2], codecs=[BYTES_LE]
-        )
+        codec = make_codec(sources=["a.bin", "b.bin"], sizes=[1, 2])
         assert pickle.loads(pickle.dumps(codec)) == codec
+
+    def test_validate_checks_the_shard_grid(self) -> None:
+        codec = make_codec(chunk_shape=(1, 8, 24))
+        with pytest.raises(jazav.ReferenceFormatError, match="rank"):
+            codec.validate(shape=(16, 24), dtype=None, chunk_grid=None)
+
+        class Grid:
+            chunk_shape = (1, 12, 24)
+
+        with pytest.raises(jazav.ReferenceFormatError, match="not a positive multiple"):
+            codec.validate(shape=(2, 16, 24), dtype=None, chunk_grid=Grid())
 
 
 class TestReferenceCodecReads:
@@ -102,7 +142,7 @@ class TestReferenceCodecReads:
         direct = zarr.open_array(tmp_path / "out.zarr" / "0", mode="r")
         np.testing.assert_array_equal(direct[:], data)
 
-    def test_missing_chunk_reads_fill_value(
+    def test_missing_entry_reads_fill_value(
         self, tmp_path: Path, data: np.ndarray
     ) -> None:
         raw_files(tmp_path / "raw", data)
@@ -118,7 +158,147 @@ class TestReferenceCodecReads:
         np.testing.assert_array_equal(array[0], data[0])
         np.testing.assert_array_equal(array[1], np.full_like(data[1], 7))
 
-    def test_corrupt_chunk_file_raises(self, tmp_path: Path, data: np.ndarray) -> None:
+    def test_missing_shard_reads_fill_value(
+        self, tmp_path: Path, data: np.ndarray
+    ) -> None:
+        raw_files(tmp_path / "raw", data)
+        array = write_virtual_array(
+            LocalStore(tmp_path / "out.zarr"),
+            shape=data.shape,
+            chunks=(1, 8, 24),
+            shards=(1, 16, 24),
+            dtype="uint16",
+            sources=["../../raw/plane0.bin"],
+            references={(0, y, 0): (0, y * 384, 384) for y in range(2)},
+            fill_value=3,
+        )
+        assert sorted(
+            p.name for p in (tmp_path / "out.zarr" / "0" / "c").iterdir()
+        ) == ["0"]
+        np.testing.assert_array_equal(array[0], data[0])
+        np.testing.assert_array_equal(array[1], np.full_like(data[1], 3))
+
+    def test_many_inner_chunks_per_shard_and_edge_shards(self, tmp_path: Path) -> None:
+        # 5 x 7 inner chunks of (2, 3) over a (9, 20) array: ragged edges on both
+        # axes, shards of 2 x 2 inner chunks, so the last shards extend past the
+        # array and the table is still full size.
+        rng = np.random.default_rng(1)
+        full = rng.integers(0, 2**16, (10, 21), dtype="<u2")  # padded to the grid
+        (tmp_path / "raw").mkdir()
+        blocks = {}
+        offset = 0
+        payload = bytearray()
+        for iy in range(5):
+            for ix in range(7):
+                block = full[iy * 2 : iy * 2 + 2, ix * 3 : ix * 3 + 3]
+                blocks[(iy, ix)] = (0, offset, block.nbytes)
+                payload += block.tobytes()
+                offset += block.nbytes
+        (tmp_path / "raw" / "blocks.bin").write_bytes(payload)
+        array = write_virtual_array(
+            LocalStore(tmp_path / "out.zarr"),
+            shape=(9, 20),
+            chunks=(2, 3),
+            shards=(4, 6),
+            dtype="uint16",
+            sources=["../../raw/blocks.bin"],
+            references=blocks,
+        )
+        assert array.chunks == (4, 6)
+        np.testing.assert_array_equal(array[:], full[:9, :20])
+        np.testing.assert_array_equal(array[3:8, 5:19], full[3:8, 5:19])
+        np.testing.assert_array_equal(array[8], full[8, :20])
+        np.testing.assert_array_equal(
+            array[[0, 8], :][:, [1, 19]], full[[0, 8]][:, [1, 19]]
+        )
+        report = jazav.verify(tmp_path / "out.zarr", deep=True)
+        assert report.ok, str(report)
+        assert (report.n_shards, report.n_chunks) == (12, 35)
+
+    def test_adjacent_blocks_are_read_with_one_range_request(
+        self, tmp_path: Path, data: np.ndarray, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw_files(tmp_path / "raw", data)
+        array = write_virtual_array(
+            LocalStore(tmp_path / "out.zarr"),
+            shape=data.shape,
+            chunks=(1, 4, 24),
+            dtype="uint16",
+            sources=["../../raw/plane0.bin", "../../raw/plane1.bin"],
+            references={
+                (c, y, 0): (c, y * 192, 192) for c in range(2) for y in range(4)
+            },
+        )
+        calls: list[tuple[str, int, int]] = []
+        original = _storeio.read_range
+
+        async def counting(store, key, prototype, offset, length):  # type: ignore[no-untyped-def]
+            calls.append((key, offset, length))
+            return await original(store, key, prototype, offset, length)
+
+        monkeypatch.setattr(_storeio, "read_range", counting)
+        np.testing.assert_array_equal(array[:], data)
+        assert sorted(calls) == [("raw/plane0.bin", 0, 768), ("raw/plane1.bin", 0, 768)]
+        calls.clear()
+        np.testing.assert_array_equal(array[1, 9:14], data[1, 9:14])
+        assert calls == [("raw/plane1.bin", 384, 384)]
+
+    def test_far_apart_blocks_are_not_coalesced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "raw").mkdir()
+        gap = b"\0" * 32
+        a = np.arange(16, dtype="<u2")
+        b = np.arange(16, 32, dtype="<u2")
+        (tmp_path / "raw" / "f.bin").write_bytes(a.tobytes() + gap + b.tobytes())
+        array = write_virtual_array(
+            LocalStore(tmp_path / "out.zarr"),
+            shape=(2, 16),
+            chunks=(1, 16),
+            dtype="uint16",
+            sources=["../../raw/f.bin"],
+            references={(0, 0): (0, 0, 32), (1, 0): (0, 64, 32)},
+        )
+        calls: list[tuple[int, int]] = []
+        original = _storeio.read_range
+
+        async def counting(store, key, prototype, offset, length):  # type: ignore[no-untyped-def]
+            calls.append((offset, length))
+            return await original(store, key, prototype, offset, length)
+
+        monkeypatch.setattr(_storeio, "read_range", counting)
+        monkeypatch.setattr(_codec, "MAX_GAP_BYTES", 16)
+        np.testing.assert_array_equal(array[:], np.stack([a, b]))
+        assert sorted(calls) == [(0, 32), (64, 32)]
+
+    def test_table_is_read_once_per_shard(
+        self, tmp_path: Path, data: np.ndarray, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw_files(tmp_path / "raw", data)
+        array = write_virtual_array(
+            LocalStore(tmp_path / "out.zarr"),
+            shape=data.shape,
+            chunks=(1, 8, 24),
+            dtype="uint16",
+            sources=["../../raw/plane0.bin", "../../raw/plane1.bin"],
+            references={
+                (c, y, 0): (c, y * 384, 384) for c in range(2) for y in range(2)
+            },
+        )
+        decoded: list[int] = []
+        original = _codec.decode_table
+
+        def counting(payload, n):  # type: ignore[no-untyped-def]
+            decoded.append(n)
+            return original(payload, n)
+
+        monkeypatch.setattr(_codec, "decode_table", counting)
+        for _ in range(3):
+            np.testing.assert_array_equal(array[0, 2:5], data[0, 2:5])
+            np.testing.assert_array_equal(array[1], data[1])
+        assert decoded == [4]
+
+    def test_corrupt_table_raises(self, tmp_path: Path, data: np.ndarray) -> None:
         raw_files(tmp_path / "raw", data)
         array = write_virtual_array(
             LocalStore(tmp_path / "out.zarr"),
@@ -128,9 +308,14 @@ class TestReferenceCodecReads:
             sources=["../../raw/plane0.bin"],
             references={(0, 0, 0): (0, 0, data[0].nbytes)},
         )
-        (tmp_path / "out.zarr" / "0" / "c" / "0" / "0" / "0").write_bytes(b"\0" * 16)
-        with pytest.raises(jazav.ReferenceFormatError, match="exactly 20 bytes"):
+        write_raw_shard(array, (0, 0, 0), b"\0" * 16)
+        with pytest.raises(
+            jazav.ReferenceFormatError, match="exactly 40 bytes, got 16"
+        ):
             array[0]
+        # A failed table fetch is not cached: fixing the table makes reads work.
+        write_table(array, {(0, 0, 0): (0, 0, data[0].nbytes)})
+        np.testing.assert_array_equal(array[0], data[0])
 
     def test_source_index_out_of_range_raises(
         self, tmp_path: Path, data: np.ndarray
@@ -144,7 +329,7 @@ class TestReferenceCodecReads:
             sources=["../../raw/plane0.bin"],
             references={},
         )
-        write_raw_chunk(array, (0, 0, 0), jazav.encode_reference(5, 0, data[0].nbytes))
+        write_table(array, {(0, 0, 0): (5, 0, data[0].nbytes)})
         with pytest.raises(jazav.ReferenceFormatError, match="source #5"):
             array[0]
 
@@ -160,7 +345,7 @@ class TestReferenceCodecReads:
             sources=["../../raw/plane0.bin"],
             references={},
         )
-        write_raw_chunk(array, (0, 0, 0), jazav.encode_reference(0, 2, data[0].nbytes))
+        write_table(array, {(0, 0, 0): (0, 2, data[0].nbytes)})
         with pytest.raises(jazav.ReferenceFormatError, match="which is only"):
             array[0]
 
@@ -234,6 +419,7 @@ class TestReferenceCodecReads:
             LocalStore(tmp_path / "out.zarr"),
             shape=data.shape,
             chunks=(1, 8, 24),
+            shards=(1, 8, 24),
             dtype="uint16",
             sources=["../../raw/plane0.bin", "../../raw/plane1.bin"],
             references={
@@ -279,7 +465,7 @@ class TestReferenceCodecReads:
             references={},
             sizes=[data[0].nbytes + 1],  # wrong on purpose: MemoryStore is unchecked
         )
-        write_raw_chunk(array, (0, 0, 0), jazav.encode_reference(0, 0, data[0].nbytes))
+        write_table(array, {(0, 0, 0): (0, 0, data[0].nbytes)})
         from zarr.core.buffer import default_buffer_prototype
 
         sync(
@@ -381,12 +567,11 @@ class TestReferenceCodecReads:
         write_virtual_array(
             LocalStore(tmp_path / "out.zarr"),
             shape=data.shape,
-            chunks=(1, 16, 24),
+            chunks=(1, 8, 24),
             dtype="uint16",
             sources=["../../raw/plane0.bin", "../../raw/plane1.bin"],
             references={
-                (0, 0, 0): (0, 0, data[0].nbytes),
-                (1, 0, 0): (1, 0, data[1].nbytes),
+                (c, y, 0): (c, y * 384, 384) for c in range(2) for y in range(2)
             },
         )
         with zarr.config.set(
@@ -394,6 +579,7 @@ class TestReferenceCodecReads:
         ):
             array = zarr.open_array(tmp_path / "out.zarr" / "0", mode="r")
             np.testing.assert_array_equal(array[:], data)
+            np.testing.assert_array_equal(array[1, 5:11, 3], data[1, 5:11, 3])
 
     def test_array_is_read_only(self, tmp_path: Path, data: np.ndarray) -> None:
         raw_files(tmp_path / "raw", data)
@@ -405,5 +591,12 @@ class TestReferenceCodecReads:
             sources=["../../raw/plane0.bin"],
             references={(0, 0, 0): (0, 0, data[0].nbytes)},
         )
+        # A whole-shard write goes straight to encode; a partial write first
+        # reads the shard through the plain decode path. Both say read-only.
         with pytest.raises(NotImplementedError, match="read-only"):
+            array[:] = 1
+        with pytest.raises(
+            (NotImplementedError, jazav.ReferenceFormatError), match="read-only"
+        ):
             array[0] = 1
+        np.testing.assert_array_equal(array[0], data[0])
